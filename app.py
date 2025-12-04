@@ -4,6 +4,46 @@ from supabase import create_client, Client
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import streamlit as st
+
+def check_password():
+    """
+    检查密码是否正确。
+    如果正确，返回 True；如果不正确，显示输入框并停止运行后续代码。
+    """
+    # 1. 如果已经验证成功，直接返回 True
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # 2. 定义密码验证的回调函数
+    def password_entered():
+        # 检查输入密码是否匹配 Secrets 中的配置
+        if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            # 为了安全，验证后删除 session 中的明文密码
+            del st.session_state["password"] 
+        else:
+            st.session_state["password_correct"] = False
+
+    # 3. 显示密码输入框
+    st.title("🔒 请输入密码访问")
+    st.text_input(
+        "Password", 
+        type="password", 
+        on_change=password_entered, 
+        key="password"
+    )
+    
+    # 4. 如果密码错误，提示错误
+    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+        st.error("😕 密码错误，请重试。")
+
+    # 5. 返回 False，表示未通过验证
+    return False
+
+# --- 执行检查 ---
+if not check_password():
+    st.stop()  # 🛑 核心步骤：如果没通过，直接停止运行下面的所有代码
 
 # -----------------------------------------------------------------------------
 # 1. Supabase Connection Setup
