@@ -155,11 +155,12 @@ if not unique_phases:
 # -----------------------------------------------------------------------------
 # 5. Tab Layout (All Performance and Comparison)
 # -----------------------------------------------------------------------------
-tab_all, tab_comparison, tab_tiers, tab_strategy = st.tabs([
+tab_all, tab_comparison, tab_tiers, tab_strategy, tab_evolution = st.tabs([
     "📈 All Performance", 
     "⚔️ Phase Comparison",
     "🏆 Position Tier Analysis",
-    "🕵️ Strategy Validation" # <--- NEW TAB
+    "🕵️ Strategy Validation",
+    "🔄 Phase Evolution"  # <--- 新增这个
 ])
 
 # =============================================================================
@@ -595,7 +596,7 @@ with tab_tiers:
 
     # Decliner S (Crash/Lost)
     df_d_s = tier_analysis_df[tier_analysis_df['Tier_Class'] == 'Decliner S (Crash/Lost)'].sort_values('Pos_Delta', ascending=False)
-    with st.expander(f"🚨 Crash: Dropped 10+ Ranks or Lost (Count: {len(df_d_s)})", expanded=True): 
+    with st.expander(f"🚨 Crash: Dropped 10+ Ranks or Lost (Count: {len(df_d_s)})", expanded=False):
         st.markdown(TOOLTIP_S_DECLINERS_EXP)
         if not df_d_s.empty:
             st.table(df_d_s[common_cols_display].head(50).style.format(col_format))
@@ -860,3 +861,174 @@ with tab_strategy:
         yaxis=dict(autorange="reversed") # Optional: make visual "up" mean rank up
     )
     st.plotly_chart(fig_scatter, use_container_width=True)
+    
+# =============================================================================
+# TAB 5: MULTI-PHASE EVOLUTION (趋势演变)
+# =============================================================================
+with tab_evolution:
+    st.header("🔄 Multi-Phase Strategy Evolution")
+    st.markdown("宏观视角：分析策略在多个阶段间的**连续演变趋势**。")
+
+    # 1. 多选 Phases (按时间顺序)
+    sorted_phases = sorted(unique_phases)
+    selected_phases_evolution = st.multiselect(
+        "Select Phases to Analyze (Ordered by Time)", 
+        options=sorted_phases, 
+        default=sorted_phases,
+        help="请按时间顺序选择并排序，系统将分析相邻两个阶段的变化 (如 P1->P2, P2->P3)。"
+    )
+
+    if len(selected_phases_evolution) < 2:
+        st.warning("⚠️ 请至少选择 2 个 Phase 进行趋势分析。")
+        st.stop()
+
+    # 2. 循环计算相邻阶段的 Metrics
+    evolution_data = []
+    
+    # 进度条
+    progress_text = "Analyzing sequential transitions..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    total_steps = len(selected_phases_evolution) - 1
+
+    for i in range(total_steps):
+        p_start = selected_phases_evolution[i]
+        p_end = selected_phases_evolution[i+1]
+        
+        # 更新进度
+        my_bar.progress((i + 1) / total_steps, text=f"Analyzing {p_start} ➡️ {p_end}...")
+
+        # --- A. 数据准备 (复用逻辑) ---
+        # 聚合 Query 数据
+        df_start = df_queries_all[df_queries_all['Phase_id'] == p_start].groupby('Top_Queries').agg({
+            'Clicks': 'sum', 'Impressions': 'sum', 'Position': 'mean'
+        }).reset_index()
+        
+        df_end = df_queries_all[df_queries_all['Phase_id'] == p_end].groupby('Top_Queries').agg({
+            'Clicks': 'sum', 'Impressions': 'sum', 'Position': 'mean'
+        }).reset_index()
+        
+        # 合并
+        df_ev = pd.merge(df_start, df_end, on='Top_Queries', how='outer', suffixes=('_A', '_B')).fillna(0)
+        
+        # 基础计算
+        MAX_RANK = 100
+        df_ev['Pos_A_Calc'] = df_ev['Position_A'].replace(0, MAX_RANK)
+        df_ev['Pos_B_Calc'] = df_ev['Position_B'].replace(0, MAX_RANK)
+        df_ev['Pos_Delta'] = df_ev['Pos_B_Calc'] - df_ev['Pos_A_Calc'] # 负数 = 变好
+        df_ev['Imp_Delta'] = df_ev['Impressions_B'] - df_ev['Impressions_A']
+        df_ev['CTR_A'] = (df_ev['Clicks_A'] / df_ev['Impressions_A'] * 100).fillna(0)
+        df_ev['CTR_B'] = (df_ev['Clicks_B'] / df_ev['Impressions_B'] * 100).fillna(0)
+        df_ev['CTR_Delta'] = df_ev['CTR_B'] - df_ev['CTR_A']
+
+        # 过滤掉完全无数据的噪音
+        valid_df = df_ev[(df_ev['Impressions_A'] > 0) | (df_ev['Impressions_B'] > 0)]
+        total_q = len(valid_df)
+        if total_q == 0: continue
+
+        # --- B. Tier Logic (简化版) ---
+        # 统计 Improvers (Tier S/A/B)
+        # Tier S: 新排名(0->>0) 或 Top3提升 或 提升>10
+        cond_new = (valid_df['Position_A'] == 0) & (valid_df['Position_B'] > 0)
+        cond_top3 = (valid_df['Position_B'] <= 3) & (valid_df['Position_B'] > 0) & (valid_df['Position_A'] > 3)
+        cond_jump10 = (valid_df['Pos_Delta'] <= -10)
+        count_tier_s = len(valid_df[cond_new | cond_top3 | cond_jump10])
+
+        # Tier A: Top 10 且 提升 >=3
+        cond_top10 = (valid_df['Position_B'] <= 10) & (valid_df['Position_B'] > 0)
+        cond_impr3 = (valid_df['Pos_Delta'] <= -3)
+        # 排除掉已经被归为 Tier S 的
+        mask_s = (cond_new | cond_top3 | cond_jump10)
+        count_tier_a = len(valid_df[cond_top10 & cond_impr3 & (~mask_s)])
+
+        # Tier B: 其他所有提升 (Delta < 0)
+        mask_better = (valid_df['Pos_Delta'] < 0)
+        # 排除 S 和 A
+        mask_a = (cond_top10 & cond_impr3 & (~mask_s))
+        count_tier_b = len(valid_df[mask_better & (~mask_s) & (~mask_a)])
+        
+        total_improvers = count_tier_s + count_tier_a + count_tier_b
+
+        # --- C. Strategy Logic (复用 Tab 4 逻辑) ---
+        # True Win: Pos变好 且 Imp增长
+        true_wins = len(valid_df[(valid_df['Pos_Delta'] < 0) & (valid_df['Imp_Delta'] > 0)])
+        win_rate = (true_wins / total_q) * 100
+
+        # Risk: CTR猛增(>3%) 但 Pos下跌
+        risks = len(valid_df[(valid_df['CTR_Delta'] > 3) & (valid_df['Pos_Delta'] > 0)])
+        risk_rate = (risks / total_q) * 100
+
+        # Data Entry
+        evolution_data.append({
+            'Transition': f"{p_start} ➡️ {p_end}",
+            'Order': i,
+            # Tier Metrics
+            'Tier S (Elite)': count_tier_s,
+            'Tier A (Solid)': count_tier_a,
+            'Tier B (General)': count_tier_b,
+            'Total Improvers': total_improvers,
+            # Strategy Metrics
+            'True Win Rate (%)': win_rate,
+            'Risk Rate (%)': risk_rate,
+            'Total Queries': total_q
+        })
+
+    my_bar.empty()
+    
+    if not evolution_data:
+        st.error("No valid data found across selected phases.")
+        st.stop()
+
+    df_trend = pd.DataFrame(evolution_data)
+
+    # ==========================
+    # VISUALIZATION
+    # ==========================
+    
+    # 1. Tier Evolution Chart (堆叠柱状图)
+    st.subheader("1. 🌊 Position Growth Momentum (Tier Evolution)")
+    st.caption("展示每个阶段切换时，获得排名提升的关键词数量及质量分布。")
+    
+    fig_tiers = go.Figure()
+    fig_tiers.add_trace(go.Bar(name='Tier S (Elite)', x=df_trend['Transition'], y=df_trend['Tier S (Elite)'], marker_color='#1f77b4'))
+    fig_tiers.add_trace(go.Bar(name='Tier A (Solid)', x=df_trend['Transition'], y=df_trend['Tier A (Solid)'], marker_color='#2ca02c'))
+    fig_tiers.add_trace(go.Bar(name='Tier B (General)', x=df_trend['Transition'], y=df_trend['Tier B (General)'], marker_color='#98df8a'))
+    
+    fig_tiers.update_layout(
+        barmode='stack', 
+        title="Number of Improving Keywords per Transition",
+        yaxis_title="Count of Keywords",
+        hovermode="x unified"
+    )
+    st.plotly_chart(fig_tiers, use_container_width=True)
+
+    # 2. Strategy Efficiency Line Chart (双轴图)
+    st.subheader("2. 📈 Strategy Effectiveness Trend")
+    st.caption("监控策略成功率 (Win Rate) 是否在持续上升，同时确保风险 (Risk Rate) 保持在低位。")
+
+    fig_strat = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Line for Win Rate
+    fig_strat.add_trace(
+        go.Scatter(x=df_trend['Transition'], y=df_trend['True Win Rate (%)'], name="✅ True Win Rate", mode='lines+markers', line=dict(color='green', width=4)),
+        secondary_y=False
+    )
+    
+    # Line for Risk Rate
+    fig_strat.add_trace(
+        go.Scatter(x=df_trend['Transition'], y=df_trend['Risk Rate (%)'], name="⚠️ Risk Rate", mode='lines+markers', line=dict(color='red', width=2, dash='dot')),
+        secondary_y=True
+    )
+
+    fig_strat.update_layout(title="Win Rate vs Risk Rate Evolution", hovermode="x unified")
+    fig_strat.update_yaxes(title_text="Win Rate (%)", secondary_y=False, range=[0, 100])
+    fig_strat.update_yaxes(title_text="Risk Rate (%)", secondary_y=True, range=[0, 50])
+    
+    st.plotly_chart(fig_strat, use_container_width=True)
+
+    # 3. Data Table
+    with st.expander("查看详细趋势数据 (View Raw Data)"):
+        st.dataframe(df_trend.style.format({
+            'True Win Rate (%)': "{:.2f}%",
+            'Risk Rate (%)': "{:.2f}%"
+        }), use_container_width=True)
